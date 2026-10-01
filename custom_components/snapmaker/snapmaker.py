@@ -351,10 +351,14 @@ class SnapmakerDevice:
                 self._token_invalid = True
             return self._data
 
-        self._token = self._get_token()
-        if self._token:
-            self._get_status()
-
+        # No saved token. Pairing needs the user at the touchscreen, so it only
+        # happens in the config flow (generate_token()). Requesting a token
+        # here would leave an approval request pending on the printer every
+        # poll, which also makes it refuse other clients with 403.
+        _LOGGER.error("No saved token for %s; reauthorize the integration", self._host)
+        self._token_invalid = True
+        self._available = False
+        self._status = "OFFLINE"
         return self._data
 
     def _set_offline(self) -> None:
@@ -652,97 +656,6 @@ class SnapmakerDevice:
             return None
         except Exception as err:
             _LOGGER.error("Unexpected error generating token: %s", err)
-            return None
-
-    def _get_token(self) -> Optional[str]:
-        """Get authentication token from Snapmaker device without polling.
-
-        This is a simplified, non-polling version used during routine updates
-        when the device has already been approved on the touchscreen. It attempts
-        immediate token validation without the multi-attempt polling loop.
-
-        For initial setup or reauth flows, use generate_token() instead, which
-        implements the polling mechanism required for user authorization.
-
-        Implements a two-step token acquisition process:
-        1. POST to /api/v1/connect to request a token
-        2. POST the received token back to validate it (no retry loop)
-
-        Use Cases:
-        - Called from update() when no token exists but device is online
-        - Assumes previous authorization or immediate approval
-        - Will fail if user hasn't pre-approved on touchscreen
-
-        Returns:
-            Optional[str]: Authentication token if successful, None otherwise
-        """
-        # Reset token invalid flag at start to ensure clean state
-        self._token_invalid = False
-        self._unsupported_protocol_reason = None
-
-        try:
-            url = f"http://{self._host}:{API_PORT}/api/v1/connect"
-
-            # First request to initiate connection
-            response = requests.post(url, timeout=API_TIMEOUT)
-
-            # Check HTTP status before parsing response
-            try:
-                response.raise_for_status()
-            except requests.exceptions.HTTPError as http_err:
-                _LOGGER.error(
-                    "HTTP error requesting token: %s. Response: %s",
-                    http_err,
-                    response.text[:200],
-                )
-                self._classify_connect_failure(response)
-                return None
-
-            # Extract token from response
-            try:
-                token = json.loads(response.text).get("token")
-            except (json.JSONDecodeError, ValueError) as json_err:
-                _LOGGER.error(
-                    "Failed to parse token response: %s. Response: %s",
-                    json_err,
-                    response.text[:200],
-                )
-                self._mark_non_json_connect_response()
-                return None
-
-            if not token:
-                _LOGGER.error("No token received from Snapmaker")
-                return None
-
-            # Second request to validate token
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            form_data = {"token": token}
-            response = requests.post(
-                url, data=form_data, headers=headers, timeout=API_TIMEOUT
-            )
-
-            # Validate token response with JSON error handling
-            try:
-                response_data = json.loads(response.text)
-                if response_data.get("token") == token:
-                    _LOGGER.info("Successfully connected to Snapmaker")
-                    self._token_invalid = False
-                    self._settle_retries_pending = True
-                    # Notify callback about new token for persistence
-                    if self._on_token_update:
-                        self._on_token_update(token)
-                    return token
-            except (json.JSONDecodeError, ValueError) as json_err:
-                _LOGGER.error("Failed to parse token validation response: %s", json_err)
-                return None
-
-            _LOGGER.error("Token validation failed")
-            return None
-        except requests.exceptions.RequestException as req_err:
-            _LOGGER.error("Network error getting token from Snapmaker: %s", req_err)
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected error getting token from Snapmaker: %s", err)
             return None
 
     def _get_status(self) -> Optional[int]:

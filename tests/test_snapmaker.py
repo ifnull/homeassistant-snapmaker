@@ -54,7 +54,7 @@ class TestSnapmakerDevice:
 
     def test_update_online_device(self, mock_socket, mock_requests):
         """Test update when device is online."""
-        device = SnapmakerDevice("192.168.1.100")
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
         result = device.update()
 
         assert device.available is True
@@ -113,77 +113,25 @@ class TestSnapmakerDevice:
         # Should retry MAX_RETRIES times
         assert mock_socket.sendto.call_count == 5
 
-    def test_get_token_success(self, mock_requests):
-        """Test successful token retrieval."""
-        device = SnapmakerDevice("192.168.1.100")
-        token = device._get_token()
-
-        assert token == "test-token-123"
-        assert mock_requests.post.call_count == 2
-
-    def test_get_token_calls_update_callback(self, mock_requests):
+    def test_generate_token_calls_update_callback(self, mock_requests):
         """Test that token update callback is called on new token."""
         callback = MagicMock()
         device = SnapmakerDevice("192.168.1.100")
         device.set_token_update_callback(callback)
 
-        token = device._get_token()
+        token = device.generate_token(max_attempts=1)
 
         assert token == "test-token-123"
         callback.assert_called_once_with("test-token-123")
 
-    def test_get_token_failure(self, mock_requests):
-        """Test token retrieval failure."""
-        mock_requests.post.return_value.text = '{"error": "Failed"}'
-
-        device = SnapmakerDevice("192.168.1.100")
-        token = device._get_token()
-
-        assert token is None
-
-    def test_get_token_no_token_in_response(self, mock_requests):
-        """Test token retrieval when no token in response."""
-        mock_requests.post.return_value.text = "{}"
-
-        device = SnapmakerDevice("192.168.1.100")
-        token = device._get_token()
-
-        assert token is None
-
-    def test_get_token_http_500_sets_unsupported_protocol_reason(self, mock_requests):
-        """Test that an HTTP 500 on connect (e.g. Artisan/J1) is flagged as unsupported firmware."""
-        error_response = MagicMock(status_code=500, text="null object reference")
-        error_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
-            response=error_response
-        )
-        mock_requests.post.return_value = error_response
-
-        device = SnapmakerDevice("192.168.1.100")
-        token = device._get_token()
-
-        assert token is None
-        assert device.unsupported_protocol_reason is not None
-
-    def test_get_token_non_json_connect_response_sets_unsupported_protocol_reason(
-        self, mock_requests
-    ):
-        """Test that a non-JSON connect response is flagged as unsupported firmware."""
-        mock_requests.post.return_value.text = "<html>not json</html>"
-
-        device = SnapmakerDevice("192.168.1.100")
-        token = device._get_token()
-
-        assert token is None
-        assert device.unsupported_protocol_reason is not None
-
-    def test_get_token_normal_failure_leaves_unsupported_protocol_reason_unset(
+    def test_generate_token_normal_failure_leaves_unsupported_protocol_reason_unset(
         self, mock_requests
     ):
         """Test a plain auth failure (no token in response) is not flagged as unsupported."""
         mock_requests.post.return_value.text = "{}"
 
         device = SnapmakerDevice("192.168.1.100")
-        token = device._get_token()
+        token = device.generate_token(max_attempts=1)
 
         assert token is None
         assert device.unsupported_protocol_reason is None
@@ -826,7 +774,7 @@ class TestTokenPersistence:
         device = SnapmakerDevice("192.168.1.100")
         device.set_token_update_callback(callback)
 
-        device._get_token()
+        device.generate_token(max_attempts=1)
 
         callback.assert_not_called()
 
@@ -919,7 +867,7 @@ class TestTokenCallbackEdgeCases:
         device.set_token_update_callback(counting_callback)
 
         # First call - should invoke callback
-        device._get_token()
+        device.generate_token(max_attempts=1)
         assert call_count == 1
         assert received_tokens == ["test-token-123"]
 
@@ -931,7 +879,7 @@ class TestTokenCallbackEdgeCases:
         device = SnapmakerDevice("192.168.1.100")
         device.set_token_update_callback(callback)
 
-        device._get_token()
+        device.generate_token(max_attempts=1)
         callback.assert_not_called()
 
 
@@ -1196,15 +1144,20 @@ class TestTokenReconnect:
         assert mock_requests.post.call_count == 1
         assert device.token_invalid is True
 
-    def test_update_without_token_skips_reconnect(self, mock_socket, mock_requests):
-        """Test that update() uses generate flow when no token is present."""
+    def test_update_without_token_requests_reauth(self, mock_socket, mock_requests):
+        """update() never pairs in the background; with no token it asks for reauth.
+
+        Requesting a token from the poll loop leaves an approval request
+        pending on the printer every 30 s, and the printer then refuses other
+        clients (Luban, other tools) with 403 until it is answered.
+        """
         device = SnapmakerDevice("192.168.1.100")
         device.update()
 
-        # Two POSTs for _get_token() (request + validate), zero for reconnect
-        assert mock_requests.post.call_count == 2
-        assert mock_requests.get.call_count == 1
-        assert device.data["tool_head"] == "Extruder"
+        assert mock_requests.post.call_count == 0
+        assert mock_requests.get.call_count == 0
+        assert device.token_invalid is True
+        assert device.available is False
 
     def test_generate_token_http_500_sets_unsupported_protocol_reason(
         self, mock_requests
