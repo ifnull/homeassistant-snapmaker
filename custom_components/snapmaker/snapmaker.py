@@ -239,13 +239,18 @@ class SnapmakerDevice:
         self._check_online()  # best-effort: populates self._model if UDP works
         return self._check_reachable()
 
-    def _connect_with_token(self, token: str) -> bool:
+    def _connect_with_token(self, token: str) -> Optional[bool]:
         """Reconnect to the device using an existing known token.
 
         The Snapmaker requires a POST to /api/v1/connect with the saved token
         to re-establish the session before status can be polled. Without this,
         the device returns 401 on every status request even with a valid token.
         This mirrors how Luban reconnects on startup.
+
+        Returns:
+            True if the device accepted the token, False if it rejected it,
+            None if the attempt failed for a transient reason (network error,
+            or HTTP 403 while another client is waiting on the touchscreen).
         """
         try:
             url = f"http://{self._host}:{API_PORT}/api/v1/connect"
@@ -255,6 +260,9 @@ class SnapmakerDevice:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=API_TIMEOUT,
             )
+            if response.status_code == 401:
+                _LOGGER.warning("Token reconnect rejected by device %s", self._host)
+                return False
             response.raise_for_status()
             try:
                 data = json.loads(response.text)
@@ -266,8 +274,36 @@ class SnapmakerDevice:
             _LOGGER.warning("Token reconnect rejected by device %s", self._host)
             return False
         except requests.exceptions.RequestException as err:
-            _LOGGER.error("Error reconnecting with token to %s: %s", self._host, err)
-            return False
+            _LOGGER.warning(
+                "Could not reconnect to %s, will retry on the next poll: %s",
+                self._host,
+                err,
+            )
+            return None
+
+    def _reconnect(self) -> bool:
+        """Reopen the session on the saved token. Returns True on success.
+
+        Only a device that rejects the token marks it invalid (triggering
+        reauth); a transient failure just fails this poll. A successful
+        reconnect clears token_invalid so the coordinator recovers.
+        """
+        result = self._connect_with_token(self._token)
+        if result:
+            self._connected = True
+            self._available = True
+            self._token_invalid = False
+            return True
+        if result is False:
+            _LOGGER.warning(
+                "Failed to reconnect with saved token for %s, "
+                "token may have been invalidated",
+                self._host,
+            )
+            self._token_invalid = True
+        self._available = False
+        self._status = "OFFLINE"
+        return False
 
     def update(self) -> Dict[str, Any]:
         """Update device data."""
@@ -297,26 +333,25 @@ class SnapmakerDevice:
         self._available = True
 
         if self._token:
-            if not self._connected:
-                # Reconnect with existing token. Required after HA startup
-                # (loading a saved token) or when the device reboots and the
-                # session is lost. _connected is reset to False by _set_offline()
-                # and on 401, so this POST only fires when actually needed.
-                # This path reuses an already-trusted token silently, with no
-                # touchscreen dialog to dismiss, so it doesn't need the
-                # settle-retry protection that follows a fresh handshake.
-                if not self._connect_with_token(self._token):
-                    _LOGGER.warning(
-                        "Failed to reconnect with saved token for %s, "
-                        "token may have been invalidated",
-                        self._host,
-                    )
-                    self._token_invalid = True
-                    return self._data
-                self._connected = True
-        else:
-            self._token = self._get_token()
+            if self._connected and self._get_status() != 401:
+                return self._data
+            # No session yet (HA startup, or the device came back online), or
+            # it expired between polls: the device drops an idle session after
+            # 10-20 s, well inside the 30 s poll interval, and answers 401
+            # until the token reconnects. Reopen it on the saved token and
+            # poll again. This reuses an already-trusted token silently, with
+            # no touchscreen dialog to dismiss, so it doesn't need the
+            # settle-retry protection that follows a fresh handshake.
+            if self._reconnect() and self._get_status() == 401:
+                _LOGGER.error(
+                    "Device %s still answers 401 after reconnecting with the "
+                    "saved token",
+                    self._host,
+                )
+                self._token_invalid = True
+            return self._data
 
+        self._token = self._get_token()
         if self._token:
             self._get_status()
 
@@ -710,8 +745,12 @@ class SnapmakerDevice:
             _LOGGER.error("Unexpected error getting token from Snapmaker: %s", err)
             return None
 
-    def _get_status(self) -> None:
-        """Get status from Snapmaker device."""
+    def _get_status(self) -> Optional[int]:
+        """Get status from Snapmaker device.
+
+        Returns 401 if the device no longer recognises the session, so the
+        caller can reconnect; None otherwise.
+        """
         try:
             url = f"http://{self._host}:{API_PORT}/api/v1/status"
 
@@ -745,12 +784,11 @@ class SnapmakerDevice:
 
             # Check for authentication errors
             if response.status_code == 401:
-                _LOGGER.error("Token authentication failed (401 Unauthorized)")
-                self._token_invalid = True
-                self._connected = False  # Force reconnect attempt on next poll
+                _LOGGER.debug("Status answered 401: session expired for %s", self._host)
+                self._connected = False  # Force a reconnect POST
                 self._available = False
                 self._status = "OFFLINE"
-                return
+                return 401
 
             # Check if response is valid
             if not response.text or response.text.strip() == "":

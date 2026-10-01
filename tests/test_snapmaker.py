@@ -495,8 +495,12 @@ class TestSnapmakerDevice:
             assert device.available is False
             assert device.status == "OFFLINE"
 
-    def test_get_status_401_clears_token_and_sets_offline(self):
-        """Test that a 401 response sets token_invalid flag and sets device offline."""
+    def test_get_status_401_drops_session_and_sets_offline(self):
+        """Test that a 401 response drops the session and sets device offline.
+
+        A 401 from status means the session expired, not that the token is
+        bad, so it must not set token_invalid by itself.
+        """
         with patch("custom_components.snapmaker.snapmaker.requests") as mock_req:
             # Use the real HTTPError class so except clause can catch it
             mock_req.exceptions.HTTPError = requests.exceptions.HTTPError
@@ -510,11 +514,12 @@ class TestSnapmakerDevice:
             device = SnapmakerDevice("192.168.1.100")
             device._token = "test-token-123"
             device._available = True
-            device._get_status()
+            device._connected = True
+            assert device._get_status() == 401
 
-            # Token should remain but token_invalid flag should be set, device should be offline
             assert device._token == "test-token-123"
-            assert device._token_invalid is True
+            assert device._token_invalid is False
+            assert device._connected is False
             assert device._available is False
             assert device.status == "OFFLINE"
 
@@ -1066,7 +1071,7 @@ class TestTokenReconnect:
         assert result is False
 
     def test_connect_with_token_request_exception(self, mock_requests):
-        """Test reconnect fails gracefully on network error."""
+        """Test a network error is a transient failure, not a rejection."""
         mock_requests.post.side_effect = mock_requests.exceptions.RequestException(
             "Connection refused"
         )
@@ -1074,7 +1079,7 @@ class TestTokenReconnect:
         device = SnapmakerDevice("192.168.1.100")
         result = device._connect_with_token("test-token-123")
 
-        assert result is False
+        assert result is None
 
     def test_update_reconnects_with_existing_token(self, mock_socket, mock_requests):
         """Test that update() POSTs to reconnect on first poll with a saved token."""
@@ -1134,6 +1139,62 @@ class TestTokenReconnect:
         assert device.token_invalid is True
         # Status GET must NOT be called after a failed reconnect
         assert mock_requests.get.call_count == 0
+
+    def test_update_reconnects_when_session_expired(self, mock_socket, mock_requests):
+        """A 401 between polls reconnects on the same token (issue #18).
+
+        The device drops an idle session after 10-20 s, so with a 30 s poll
+        interval every poll finds it expired. That must not trigger reauth.
+        """
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
+        device.update()  # first poll connects
+        mock_requests.reset_mock()
+
+        ok = mock_requests.get.return_value
+        mock_requests.get.side_effect = [MagicMock(status_code=401, text=""), ok]
+        device.update()
+
+        assert mock_requests.post.call_count == 1  # reconnect POST
+        assert mock_requests.get.call_count == 2  # expired, then fresh status
+        assert device.token_invalid is False
+        assert device.available is True
+        assert device._connected is True
+        assert device.status == "IDLE"
+
+    def test_update_reconnect_clears_token_invalid(self, mock_socket, mock_requests):
+        """A successful reconnect clears a stale token_invalid so entities recover."""
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
+        device._token_invalid = True
+
+        device.update()
+
+        assert device.token_invalid is False
+        assert device.available is True
+
+    def test_update_busy_reconnect_is_transient(self, mock_socket, mock_requests):
+        """A 403 on reconnect (another client pairing) fails one poll, no reauth."""
+        busy = MagicMock(status_code=403, text="Failed to connect")
+        busy.raise_for_status.side_effect = requests.exceptions.HTTPError(response=busy)
+        mock_requests.post.return_value = busy
+
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
+        device.update()
+
+        assert device.token_invalid is False
+        assert device.available is False
+        assert mock_requests.get.call_count == 0
+
+    def test_update_401_after_reconnect_marks_token_invalid(
+        self, mock_socket, mock_requests
+    ):
+        """If status still answers 401 right after a reconnect, the token is bad."""
+        mock_requests.get.return_value = MagicMock(status_code=401, text="")
+
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
+        device.update()
+
+        assert mock_requests.post.call_count == 1
+        assert device.token_invalid is True
 
     def test_update_without_token_skips_reconnect(self, mock_socket, mock_requests):
         """Test that update() uses generate flow when no token is present."""
