@@ -67,7 +67,7 @@ API requirements. This ensures only authorized connections can access device dat
 1. Config flow initiates token request via POST to `/api/v1/connect`
 2. Device responds with a temporary token
 3. User must approve the connection on the Snapmaker touchscreen
-4. Integration polls the token validation endpoint (10s intervals, max 5 minutes)
+4. Integration polls `/api/v1/status` with the token (2s intervals, max 3 minutes): 204 means the prompt is still pending, 200 means approved, 401 means rejected
 5. Once approved, token is validated and persisted to config entry
 
 **Token Persistence**:

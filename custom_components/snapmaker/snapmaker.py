@@ -477,23 +477,25 @@ class SnapmakerDevice:
             udp_socket.close()
 
     def generate_token(
-        self, max_attempts: int = 18, poll_interval: int = 10
+        self, max_attempts: int = 90, poll_interval: int = 2
     ) -> Optional[str]:
         """Generate a new authentication token from Snapmaker device.
 
-        This method implements a polling mechanism similar to the reference implementations.
-        The user must approve the connection on the Snapmaker touchscreen before the
-        token can be validated.
+        The device hands out a token on the first /api/v1/connect POST, before
+        anyone has approved it. Approval is only visible on /api/v1/status,
+        which answers 204 with an empty body while the touchscreen prompt is
+        pending, 200 with the status JSON once the user taps Authorize, and 401
+        if the token is rejected. This mirrors how Luban pairs.
 
         IMPORTANT: This method blocks the executor thread for up to
         (max_attempts * poll_interval) seconds. Default settings can block
-        for up to 3 minutes (18 × 10s), which may impact the thread pool's
+        for up to 3 minutes (90 × 2s), which may impact the thread pool's
         ability to handle other tasks. Consider the thread pool size when
         calling this method.
 
         Args:
-            max_attempts: Maximum number of polling attempts (default 18 = 3 minutes)
-            poll_interval: Seconds to wait between polling attempts (default 10)
+            max_attempts: Maximum number of status polls (default 90 = 3 minutes)
+            poll_interval: Seconds to wait between status polls (default 2)
 
         Returns:
             Optional[str]: Authentication token if successful, None otherwise
@@ -538,52 +540,50 @@ class SnapmakerDevice:
                 "Token received, waiting for user authorization on touchscreen..."
             )
 
-            # Poll until user authorizes on touchscreen
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            form_data = {"token": token}
-
-            # Poll for user authorization on touchscreen
+            # Poll status until the user authorizes on the touchscreen.
             # First attempt is immediate (no sleep), subsequent attempts wait poll_interval
+            status_url = f"http://{self._host}:{API_PORT}/api/v1/status"
             for attempt in range(max_attempts):
                 try:
-                    # Wait before attempting validation (skip on first attempt to try immediately)
                     if attempt > 0:
                         # Blocking sleep in executor thread - this is acceptable as it runs
                         # in a separate thread pool, not blocking the event loop
                         time.sleep(poll_interval)
 
-                    # Try to validate token by posting it back to the device
-                    response = requests.post(
-                        url, data=form_data, headers=headers, timeout=API_TIMEOUT
+                    response = requests.get(
+                        status_url, params={"token": token}, timeout=API_TIMEOUT
                     )
 
-                    # Check HTTP status before parsing response
-                    response.raise_for_status()
+                    if response.status_code == 401:
+                        _LOGGER.error(
+                            "Snapmaker at %s rejected the token (401)", self._host
+                        )
+                        return None
 
-                    # Check if token was validated by Snapmaker
-                    # Per Snapmaker API spec, a successful validation echoes back the same token
-                    try:
-                        response_data = json.loads(response.text)
-                        if response_data.get("token") == token:
-                            _LOGGER.info("Token validated successfully")
-                            self._token = token
-                            self._token_invalid = False
-                            # Session is now established; next update() can skip
-                            # the reconnect POST and go straight to _get_status().
-                            self._connected = True
-                            self._settle_retries_pending = True
-                            # Notify callback about new token for persistence
-                            if self._on_token_update:
-                                self._on_token_update(token)
-                            return token
-                    except (json.JSONDecodeError, ValueError) as json_err:
+                    # 204 / empty body: the approval prompt is still on screen
+                    if response.status_code == 204 or not (
+                        response.text and response.text.strip()
+                    ):
                         _LOGGER.debug(
-                            "Token validation attempt %d/%d: %s",
+                            "Awaiting touchscreen approval (attempt %d/%d)",
                             attempt + 1,
                             max_attempts,
-                            json_err,
                         )
                         continue
+
+                    response.raise_for_status()
+
+                    _LOGGER.info("Token approved on touchscreen")
+                    self._token = token
+                    self._token_invalid = False
+                    # Session is now established; next update() can skip
+                    # the reconnect POST and go straight to _get_status().
+                    self._connected = True
+                    self._settle_retries_pending = True
+                    # Notify callback about new token for persistence
+                    if self._on_token_update:
+                        self._on_token_update(token)
+                    return token
 
                 except requests.exceptions.RequestException as req_err:
                     _LOGGER.debug(
@@ -595,10 +595,21 @@ class SnapmakerDevice:
                     continue
 
             _LOGGER.warning(
-                "Token validation failed after %d attempts. "
-                "User may not have authorized on touchscreen.",
+                "Token not approved after %d attempts. "
+                "User may not have authorized on touchscreen. Note that the "
+                "prompt only appears while the touchscreen is on its home screen.",
                 max_attempts,
             )
+            # Withdraw the request so the prompt doesn't linger on the screen
+            try:
+                requests.post(
+                    f"http://{self._host}:{API_PORT}/api/v1/disconnect",
+                    data={"token": token},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=API_TIMEOUT,
+                )
+            except requests.exceptions.RequestException:
+                pass
             return None
 
         except requests.exceptions.RequestException as req_err:

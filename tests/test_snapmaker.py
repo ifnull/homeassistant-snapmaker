@@ -1181,6 +1181,56 @@ class TestTokenReconnect:
         assert token == "test-token-123"
         assert device._connected is True
 
+    def test_generate_token_waits_for_touchscreen_approval(self, mock_requests):
+        """generate_token() keeps polling status while it answers 204 (issue #18).
+
+        The connect POST returns a token before the user approves it, so the
+        token alone is not proof of approval; status answers 204 until the
+        user taps Authorize.
+        """
+        pending = MagicMock(status_code=204, text="")
+        approved = mock_requests.get.return_value
+        mock_requests.get.side_effect = [pending, pending, approved]
+
+        device = SnapmakerDevice("192.168.1.100")
+        with patch("custom_components.snapmaker.snapmaker.time.sleep") as mock_sleep:
+            token = device.generate_token(max_attempts=5, poll_interval=2)
+
+        assert token == "test-token-123"
+        assert device.token == "test-token-123"
+        assert device._connected is True
+        assert mock_requests.get.call_count == 3
+        assert mock_sleep.call_args_list == [call(2), call(2)]
+        # A single connect POST; re-posting could raise a second prompt
+        assert mock_requests.post.call_count == 1
+
+    def test_generate_token_rejected_returns_none(self, mock_requests):
+        """generate_token() stops polling as soon as status answers 401."""
+        mock_requests.get.return_value = MagicMock(status_code=401, text="")
+
+        device = SnapmakerDevice("192.168.1.100")
+        with patch("custom_components.snapmaker.snapmaker.time.sleep"):
+            token = device.generate_token(max_attempts=5)
+
+        assert token is None
+        assert device.token is None
+        assert device._connected is False
+        assert mock_requests.get.call_count == 1
+
+    def test_generate_token_timeout_withdraws_request(self, mock_requests):
+        """generate_token() disconnects if the prompt is never approved."""
+        mock_requests.get.return_value = MagicMock(status_code=204, text="")
+
+        device = SnapmakerDevice("192.168.1.100")
+        with patch("custom_components.snapmaker.snapmaker.time.sleep"):
+            token = device.generate_token(max_attempts=3)
+
+        assert token is None
+        assert device._connected is False
+        assert mock_requests.get.call_count == 3
+        disconnect_url = mock_requests.post.call_args_list[-1].args[0]
+        assert disconnect_url.endswith("/api/v1/disconnect")
+
     def test_update_after_generate_token_skips_reconnect_post(
         self, mock_socket, mock_requests
     ):
