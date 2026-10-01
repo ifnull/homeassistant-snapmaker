@@ -153,6 +153,44 @@ class TestSnapmakerDevice:
         assert device.data["elapsed_time"] == "0:05:00"
         assert device.data["remaining_time"] == "0:05:00"
 
+    def test_get_status_snapmaker2_idle_response(self, mock_requests):
+        """Parse an idle A350 response (firmware 1.x): "homed" and "moduleList".
+
+        Shape captured from a real Snapmaker 2.0 A350; the module flags are
+        switched on here so the nested lookup is actually exercised.
+        """
+        mock_requests.get.return_value.text = """{
+            "status": "IDLE",
+            "x": -19, "y": 354, "z": 325.089,
+            "offsetX": 0, "offsetY": 0, "offsetZ": 0,
+            "homed": true,
+            "toolHead": "TOOLHEAD_3DPRINTING_1",
+            "nozzleTemperature": 31, "nozzleTargetTemperature": 0,
+            "heatedBedTemperature": 27, "heatedBedTargetTemperature": 0,
+            "isFilamentOut": false,
+            "workSpeed": 3000,
+            "printStatus": "Complete",
+            "moduleList": {
+                "enclosure": true,
+                "rotaryModule": false,
+                "emergencyStopButton": true,
+                "airPurifier": false
+            }
+        }"""
+        device = SnapmakerDevice("192.168.1.100")
+        device._token = "test-token-123"
+        device._available = True
+        device._get_status()
+
+        assert device.data["nozzle_temperature"] == 31
+        assert device.data["heated_bed_temperature"] == 27
+        assert device.data["x"] == -19
+        assert device.data["homing"] == "Homed"
+        assert device.data["has_enclosure"] is True
+        assert device.data["has_rotary_module"] is False
+        assert device.data["has_emergency_stop"] is True
+        assert device.data["has_air_purifier"] is False
+
     def test_get_status_additional_fields(self, mock_requests):
         """Test that additional fields are parsed from API response."""
         device = SnapmakerDevice("192.168.1.100")

@@ -830,15 +830,29 @@ class SnapmakerDevice:
             x = data.get("x", 0)
             y = data.get("y", 0)
             z = data.get("z", 0)
-            homing = data.get("homing", "N/A")
+            # Snapmaker 2.0 firmware reports a boolean "homed" rather than a
+            # "homing" axis string
+            homing = data.get("homing")
+            if homing is None:
+                homed = data.get("homed")
+                homing = "N/A" if homed is None else ("Homed" if homed else "Not homed")
 
-            # Extract module/safety data
+            # Extract module/safety data. Snapmaker 2.0 firmware nests the
+            # module flags under "moduleList" and names the emergency stop
+            # "emergencyStopButton"; fall back to top-level keys otherwise.
             is_filament_out = data.get("isFilamentOut", False)
             is_door_open = data.get("isDoorOpen", False)
-            has_enclosure = data.get("enclosure", False)
-            has_rotary_module = data.get("rotaryModule", False)
-            has_emergency_stop = data.get("emergencyStop", False)
-            has_air_purifier = data.get("airPurifier", False)
+            modules = data.get("moduleList") or {}
+            has_enclosure = modules.get("enclosure", data.get("enclosure", False))
+            has_rotary_module = modules.get(
+                "rotaryModule", data.get("rotaryModule", False)
+            )
+            has_emergency_stop = modules.get(
+                "emergencyStopButton", data.get("emergencyStop", False)
+            )
+            has_air_purifier = modules.get(
+                "airPurifier", data.get("airPurifier", False)
+            )
 
             # Extract G-code line progress
             total_lines = data.get("totalLines", 0)
