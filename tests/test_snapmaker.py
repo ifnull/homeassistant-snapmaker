@@ -192,6 +192,20 @@ class TestSnapmakerDevice:
         assert device.data["has_emergency_stop"] is True
         assert device.data["has_air_purifier"] is False
 
+    def test_get_status_module_list_not_a_dict(self, mock_requests):
+        """An unexpected moduleList shape must not take the device offline."""
+        mock_requests.get.return_value.text = (
+            '{"status": "IDLE", "nozzleTemperature": 30, "moduleList": ["enclosure"]}'
+        )
+        device = SnapmakerDevice("192.168.1.100")
+        device._token = "test-token-123"
+        device._available = True
+        device._get_status()
+
+        assert device.available is True
+        assert device.data["nozzle_temperature"] == 30
+        assert device.data["has_enclosure"] is False
+
     def test_get_status_additional_fields(self, mock_requests):
         """Test that additional fields are parsed from API response."""
         device = SnapmakerDevice("192.168.1.100")

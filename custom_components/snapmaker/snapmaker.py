@@ -860,7 +860,9 @@ class SnapmakerDevice:
             # "emergencyStopButton"; fall back to top-level keys otherwise.
             is_filament_out = data.get("isFilamentOut", False)
             is_door_open = data.get("isDoorOpen", False)
-            modules = data.get("moduleList") or {}
+            modules = data.get("moduleList")
+            if not isinstance(modules, dict):
+                modules = {}
             has_enclosure = modules.get("enclosure", data.get("enclosure", False))
             has_rotary_module = modules.get(
                 "rotaryModule", data.get("rotaryModule", False)
