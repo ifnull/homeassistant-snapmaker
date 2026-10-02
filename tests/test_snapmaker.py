@@ -7,6 +7,7 @@ import requests
 
 from custom_components.snapmaker.snapmaker import (
     API_PORT,
+    BUSY_REAUTH_POLLS,
     REACHABILITY_MAX_RETRIES,
     SENSITIVE_API_KEYS,
     STATUS_EMPTY_RETRY_COUNT,
@@ -1169,6 +1170,45 @@ class TestTokenReconnect:
         assert device.token_invalid is False
         assert device.available is False
         assert mock_requests.get.call_count == 0
+
+    @staticmethod
+    def _busy_response():
+        busy = MagicMock(status_code=403, text="Failed to connect")
+        busy.raise_for_status.side_effect = requests.exceptions.HTTPError(response=busy)
+        return busy
+
+    def test_update_persistent_403_requests_reauth(self, mock_socket, mock_requests):
+        """A 403 that never clears means the token is no longer accepted.
+
+        Without this, a device that keeps refusing the saved token would leave
+        every entity unavailable with no reauth prompt.
+        """
+        mock_requests.post.return_value = self._busy_response()
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
+
+        for _ in range(BUSY_REAUTH_POLLS - 1):
+            device.update()
+            assert device.token_invalid is False
+        device.update()
+
+        assert device.token_invalid is True
+        assert mock_requests.get.call_count == 0
+
+    def test_update_403_streak_resets_on_success(self, mock_socket, mock_requests):
+        """Occasional collisions spread over time never add up to a reauth."""
+        ok = mock_requests.post.return_value
+        device = SnapmakerDevice("192.168.1.100", token="test-token-123")
+
+        for _ in range(2):
+            mock_requests.post.return_value = self._busy_response()
+            for _ in range(BUSY_REAUTH_POLLS - 1):
+                device.update()
+            mock_requests.post.return_value = ok
+            device.update()  # reconnect succeeds, streak resets
+            device._connected = False  # next poll reconnects again
+
+        assert device.token_invalid is False
+        assert device._busy_polls == 0
 
     def test_update_401_after_reconnect_marks_token_invalid(
         self, mock_socket, mock_requests

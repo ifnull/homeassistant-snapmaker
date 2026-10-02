@@ -33,6 +33,11 @@ REACHABILITY_BACKOFF_BASE = 1
 # right after token generation succeeds.
 STATUS_EMPTY_RETRY_COUNT = 3
 STATUS_EMPTY_RETRY_DELAY = 1.0  # Seconds between empty-response retries
+# The device answers 403 to every connect while another client's connect or
+# touchscreen approval is pending. A collision clears within a poll; a 403 that
+# persists this many polls in a row (~5 min) means the device no longer accepts
+# our token, so it is treated as rejected and reauth is requested.
+BUSY_REAUTH_POLLS = 10
 
 # Keys to strip from the raw API response before exposing as diagnostic attributes
 SENSITIVE_API_KEYS = {"token"}
@@ -66,6 +71,7 @@ class SnapmakerDevice:
         self._connected = (
             False  # True once _connect_with_token() succeeds; reset on offline/401
         )
+        self._busy_polls = 0  # consecutive reconnects refused with 403
 
     @property
     def host(self) -> str:
@@ -263,6 +269,18 @@ class SnapmakerDevice:
             if response.status_code == 401:
                 _LOGGER.warning("Token reconnect rejected by device %s", self._host)
                 return False
+            if response.status_code == 403:
+                self._busy_polls += 1
+                if self._busy_polls >= BUSY_REAUTH_POLLS:
+                    _LOGGER.warning(
+                        "Device %s has refused the saved token with 403 for %d "
+                        "polls in a row; treating it as rejected",
+                        self._host,
+                        self._busy_polls,
+                    )
+                    return False
+            else:
+                self._busy_polls = 0
             response.raise_for_status()
             try:
                 data = json.loads(response.text)
